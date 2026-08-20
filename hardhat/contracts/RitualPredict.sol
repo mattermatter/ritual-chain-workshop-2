@@ -205,7 +205,34 @@ contract RitualPredict {
     function createMarket(
         NewMarket calldata p
     ) external returns (uint256 marketId) {
-        // we'll fill this up
+        if (p.bettingSeconds < MIN_BETTING_SECONDS) revert BadDuration();
+        if (p.resolveDelaySeconds < MIN_RESOLVE_DELAY_SECONDS) revert BadDuration();
+        if (p.bettingSeconds + p.resolveDelaySeconds > MAX_MARKET_SECONDS) revert BadDuration();
+        if (bytes(p.question).length == 0) revert EmptyString();
+        if (bytes(p.oracleUrl).length == 0) revert EmptyString();
+        if (bytes(p.jsonPath).length == 0) revert EmptyString();
+
+        uint64 closeBlock = uint64(block.number + _secondsToBlocks(p.bettingSeconds));
+        uint64 resolveBlock = uint64(closeBlock + _secondsToBlocks(p.resolveDelaySeconds));
+
+        marketId = ++marketCount;
+        Market storage m = _markets[marketId];
+        m.id = marketId;
+        m.creator = msg.sender;
+        m.question = p.question;
+        m.oracleUrl = p.oracleUrl;
+        m.jsonPath = p.jsonPath;
+        m.target = p.target;
+        m.comparator = p.comparator;
+        m.closeBlock = closeBlock;
+        m.resolveBlock = resolveBlock;
+        m.state = MarketState.Open;
+
+        uint256 scheduleId = _scheduleResolution(marketId, resolveBlock);
+        m.scheduleId = scheduleId;
+
+        emit MarketCreated(marketId, msg.sender, p.question, closeBlock, resolveBlock, scheduleId);
+        emit ResolutionRuleSet(marketId, p.oracleUrl, p.jsonPath, p.target, p.comparator);
     }
 
     function bet(uint256 marketId, bool isYes) external payable {
@@ -237,7 +264,43 @@ contract RitualPredict {
         uint256 executionIndex,
         uint256 marketId
     ) external {
-        // we'll fill this up
+        if (msg.sender != RitualChain.SCHEDULER) revert OnlyScheduler();
+
+        // idempotent — leftover executions after a successful resolve are harmless
+        Market storage m = _markets[marketId];
+        if (m.closeBlock == 0) return;
+        if (m.state == MarketState.Resolved || m.state == MarketState.Invalid) return;
+
+        uint8 attempt = m.attempts + 1;
+        m.attempts = attempt;
+
+        if (m.state == MarketState.Open || m.state == MarketState.Closed)
+            m.state = MarketState.Resolving;
+
+        address executor = _pickExecutor(marketId, executionIndex);
+        emit ResolutionAttempted(marketId, attempt, executor);
+
+        (bool ok, uint256 value, string memory reason) = _readOracle(m, executor);
+        if (!ok) {
+            _fail(m, marketId, attempt, reason);
+            return;
+        }
+
+        bool yesWins = _compare(value, m.target, m.comparator);
+        m.observedValue = value;
+
+        // cancel remaining retries; revert inside cancel is fine to swallow
+        try IScheduler(RitualChain.SCHEDULER).cancel(m.scheduleId) {} catch {}
+
+        uint256 winningPool = yesWins ? m.totalYes : m.totalNo;
+        if (winningPool == 0) {
+            _invalidate(m, marketId, "no stake on winning side");
+            return;
+        }
+
+        m.state = MarketState.Resolved;
+        m.outcome = yesWins ? Outcome.Yes : Outcome.No;
+        emit MarketResolved(marketId, m.outcome, value);
     }
 
     /// A failed oracle read is never interpreted as NO. Once the booked attempts are
@@ -377,7 +440,37 @@ contract RitualPredict {
         Market storage m,
         address executor
     ) private returns (bool ok, uint256 value, string memory reason) {
-        // we'll fill this up
+        bytes memory httpCalldata = abi.encode(
+            m.oracleUrl,
+            RitualChain.HTTP_GET,
+            new string[](0),
+            bytes(""),
+            executor,
+            HTTP_TTL_BLOCKS
+        );
+
+        (bool httpOk, bytes memory rawResponse) = RitualChain.HTTP_PRECOMPILE.call(httpCalldata);
+        if (!httpOk || rawResponse.length == 0)
+            return (false, 0, "http precompile call failed");
+
+        // go through external try so a malformed envelope doesn't revert the whole tx
+        uint16 status;
+        bytes memory body;
+        string memory errorMessage;
+        try this.decodeHttpResponse(rawResponse) returns (uint16 s, bytes memory b, string memory e) {
+            (status, body, errorMessage) = (s, b, e);
+        } catch {
+            return (false, 0, "async not settled");
+        }
+
+        if (bytes(errorMessage).length > 0) return (false, 0, errorMessage);
+        if (status != 200) return (false, 0, "non-200 status");
+        if (body.length == 0) return (false, 0, "empty body");
+
+        (bool jqOk, uint256 parsed) = _jqUint(m.jsonPath, string(body));
+        if (!jqOk) return (false, 0, "jq failed");
+
+        return (true, parsed, "");
     }
 
     /**
@@ -420,7 +513,11 @@ contract RitualPredict {
         uint256 marketId,
         uint256 executionIndex
     ) private view returns (address) {
-        // we'll fill this up
+        // mix in block.number so retries don't always hit the same slot
+        uint256 seed = uint256(keccak256(abi.encodePacked(marketId, executionIndex, block.number)));
+        (address executor, bool found) = ITEEServiceRegistry(RitualChain.TEE_SERVICE_REGISTRY)
+            .pickServiceByCapability(RitualChain.CAPABILITY_HTTP_CALL, true, seed, EXECUTOR_PROBES);
+        return found ? executor : address(0);
     }
 
     // ────────────────────── Ritual: scheduling ───────────────────────────
@@ -429,7 +526,25 @@ contract RitualPredict {
         uint256 marketId,
         uint64 resolveBlock
     ) private returns (uint256 callId) {
-        // we'll fill this up
+        // bytes 4-35 get overwritten with the real executionIndex at call time
+        bytes memory data = abi.encodeWithSelector(
+            this.onScheduledResolve.selector,
+            uint256(0),
+            marketId
+        );
+
+        callId = IScheduler(RitualChain.SCHEDULER).schedule(
+            data,
+            RESOLVE_GAS_LIMIT,
+            uint32(resolveBlock),
+            MAX_ATTEMPTS,
+            RETRY_INTERVAL_BLOCKS,
+            SCHEDULER_TTL_BLOCKS,
+            MIN_MAX_FEE_PER_GAS,
+            MIN_MAX_FEE_PER_GAS,
+            0,
+            address(this)
+        );
     }
 
     // ────────────────────────────── Helpers ──────────────────────────────
